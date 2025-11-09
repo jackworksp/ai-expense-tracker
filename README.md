@@ -53,13 +53,30 @@ CSV Upload → Parse → Extract Features → ML Model → Predict Category → 
 
 ## API Endpoints
 ```
-POST /api/auth/register
-POST /api/auth/login
-POST /api/transactions/upload
-GET  /api/transactions/list
-PUT  /api/transactions/confirm
-GET  /api/analytics/summary
+POST /api/upload
+POST /api/predict
+GET  /api/categories
+POST /api/stats
+GET  /api/health
 ```
+
+### Testing the API with Postman
+
+1. **Create a collection** named `AI Expense Tracker` and add a `{{base_url}}` environment variable that points to your running Flask server (for example, `http://localhost:5000`).
+2. **Upload and train** – add a `POST {{base_url}}/api/upload` request that uses `form-data` with a key named `file` to attach an HDFC bank statement Excel or CSV file. A successful call responds with training metrics and a preview of categorized transactions.
+3. **Predict categories** – add a `POST {{base_url}}/api/predict` request with a raw JSON body:
+   ```json
+   {
+     "transactions": [
+       {"Date": "2024-05-01", "Narration": "SWIGGY ORDER", "Amount": 450, "Type": "Debit"},
+       {"Date": "2024-05-02", "Narration": "Salary credit", "Amount": 65000, "Type": "Credit"}
+     ]
+   }
+   ```
+   The response returns the predicted category and confidence for each transaction. This endpoint requires that the model has been trained via `/api/upload` first.
+4. **Available categories** – add a `GET {{base_url}}/api/categories` request to retrieve the list of rule-based categories exposed by the service.
+5. **Transaction statistics** – add a `POST {{base_url}}/api/stats` request mirroring the upload format (attach a statement as `file`) to receive aggregates such as totals, averages, and optional category distribution when the model is trained.
+6. **Health check** – add a `GET {{base_url}}/api/health` request to verify the API status and whether the model has been trained in the current session.
 
 ## Why This Approach Works
 UPI transactions often contain cryptic descriptors such as "UPI-PAYTM-123456" rather than clear merchant names. By leveraging numerical and behavioral features (amount, time, historical spending patterns) alongside a shared machine learning model enriched with user-specific profiles, the system delivers personalized predictions without the overhead of maintaining separate models per user.
