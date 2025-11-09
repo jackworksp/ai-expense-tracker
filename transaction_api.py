@@ -14,7 +14,9 @@ from sklearn.preprocessing import LabelEncoder
 import re
 import pickle
 import os
+import tempfile
 from datetime import datetime
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
@@ -45,13 +47,21 @@ class TransactionProcessor:
         self.is_trained = False
         
     def parse_bank_statement(self, file_path):
-        """Parse HDFC bank statement Excel file"""
-        df = pd.read_excel(file_path, header=None)
-        
+        """Parse uploaded HDFC bank statement file (Excel or CSV)"""
+        _, extension = os.path.splitext(file_path)
+        extension = extension.lower()
+
+        if extension in {'.xls', '.xlsx'}:
+            df = pd.read_excel(file_path, header=None)
+        elif extension == '.csv':
+            df = pd.read_csv(file_path, header=None)
+        else:
+            raise ValueError("Unsupported file format. Please upload an Excel or CSV statement.")
+
         # Find the header row (contains 'Date')
         header_idx = None
         for idx, row in df.iterrows():
-            if any('Date' in str(cell) for cell in row.values):
+            if any('date' in str(cell).lower() for cell in row.values):
                 header_idx = idx
                 break
         
@@ -87,7 +97,7 @@ class TransactionProcessor:
         features = []
         
         for _, row in transactions.iterrows():
-            narration = str(row['Narration']).lower()
+            narration = str(row.get('Narration', '')).lower()
             
             # Text features
             text_features = {
@@ -97,11 +107,14 @@ class TransactionProcessor:
                 'has_imps': 1 if 'imps' in narration else 0,
                 'has_neft': 1 if 'neft' in narration else 0,
                 'has_atm': 1 if 'atm' in narration else 0,
-                'is_debit': 1 if row['Type'] == 'Debit' else 0,
+                'is_debit': 1 if str(row.get('Type', '')).lower() == 'debit' else 0,
             }
-            
+
             # Amount features
-            amount = row['Amount']
+            try:
+                amount = float(row.get('Amount', 0))
+            except (TypeError, ValueError):
+                amount = 0.0
             text_features.update({
                 'amount': amount,
                 'amount_log': np.log1p(amount),
@@ -111,14 +124,28 @@ class TransactionProcessor:
             })
             
             # Date features
-            if pd.notna(row['Date']):
-                text_features.update({
-                    'day_of_week': row['Date'].dayofweek,
-                    'day_of_month': row['Date'].day,
-                    'month': row['Date'].month,
-                    'is_weekend': 1 if row['Date'].dayofweek >= 5 else 0,
-                    'is_month_end': 1 if row['Date'].day >= 25 else 0,
+            date_value = row.get('Date')
+            date_features = {
+                'day_of_week': np.nan,
+                'day_of_month': np.nan,
+                'month': np.nan,
+                'is_weekend': 0,
+                'is_month_end': 0,
+            }
+
+            if pd.notna(date_value):
+                date_value = pd.to_datetime(date_value, errors='coerce')
+
+            if pd.notna(date_value):
+                date_features.update({
+                    'day_of_week': date_value.dayofweek,
+                    'day_of_month': date_value.day,
+                    'month': date_value.month,
+                    'is_weekend': 1 if date_value.dayofweek >= 5 else 0,
+                    'is_month_end': 1 if date_value.day >= 25 else 0,
                 })
+
+            text_features.update(date_features)
             
             features.append(text_features)
         
@@ -230,12 +257,14 @@ def upload_and_train():
             return jsonify({'error': 'No file selected'}), 400
         
         # Save uploaded file
-        filepath = os.path.join('', file.filename)
+        filename = secure_filename(file.filename)
+        temp_dir = tempfile.mkdtemp(prefix='uploads_')
+        filepath = os.path.join(temp_dir, filename)
         file.save(filepath)
-        
+
         # Parse transactions
         transactions = processor.parse_bank_statement(filepath)
-        
+
         # Train model
         training_results = processor.train_model(transactions)
         
@@ -253,9 +282,18 @@ def upload_and_train():
         }
         
         return jsonify(response)
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+    finally:
+        try:
+            if 'filepath' in locals() and os.path.exists(filepath):
+                os.remove(filepath)
+            if 'temp_dir' in locals() and os.path.isdir(temp_dir):
+                os.rmdir(temp_dir)
+        except OSError:
+            pass
 
 @app.route('/api/predict', methods=['POST'])
 def predict_transactions():
@@ -267,10 +305,70 @@ def predict_transactions():
         data = request.json
         if not data or 'transactions' not in data:
             return jsonify({'error': 'No transactions provided'}), 400
-        
+
         # Convert to DataFrame
         df = pd.DataFrame(data['transactions'])
-        
+
+        if df.empty:
+            return jsonify({'error': 'No transactions provided'}), 400
+
+        # Normalize columns (case-insensitive aliases)
+        df.columns = [str(col).strip() for col in df.columns]
+
+        def normalize_header(name):
+            return re.sub(r'[^a-z0-9]+', '', str(name).lower())
+
+        normalized_to_original = {}
+        for col in df.columns:
+            normalized_key = normalize_header(col)
+            if normalized_key and normalized_key not in normalized_to_original:
+                normalized_to_original[normalized_key] = col
+
+        def resolve_column(*aliases):
+            for alias in aliases:
+                normalized_alias = normalize_header(alias)
+                if normalized_alias in normalized_to_original:
+                    return normalized_to_original[normalized_alias], alias
+            return None, None
+
+        date_source, _ = resolve_column('date', 'transaction_date', 'value_date')
+        if date_source:
+            df['Date'] = pd.to_datetime(df[date_source], errors='coerce')
+        elif 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        else:
+            df['Date'] = pd.NaT
+
+        amount_source, amount_alias = resolve_column('amount', 'transaction_amount', 'withdrawal', 'deposit', 'credit', 'debit')
+        if amount_source:
+            df['Amount'] = pd.to_numeric(df[amount_source], errors='coerce').fillna(0)
+        elif 'Amount' in df.columns:
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+        else:
+            df['Amount'] = 0.0
+
+        type_source, type_alias = resolve_column('type', 'transaction_type', 'credit_debit')
+        if type_source:
+            df['Type'] = df[type_source].fillna('').astype(str)
+        elif 'Type' in df.columns:
+            df['Type'] = df['Type'].fillna('').astype(str)
+        else:
+            df['Type'] = np.where(df['Amount'] >= 0, 'Debit', 'Credit')
+
+        # Adjust inferred type if the amount alias implies the direction
+        if not type_source and amount_alias in {'deposit', 'credit'}:
+            df['Type'] = 'Credit'
+        elif not type_source and amount_alias in {'withdrawal', 'debit'}:
+            df['Type'] = 'Debit'
+
+        narration_source, narration_alias = resolve_column('narration', 'description', 'details', 'transaction_details')
+        if narration_source and narration_source != 'Narration':
+            df['Narration'] = df[narration_source].fillna('').astype(str)
+        elif 'Narration' in df.columns:
+            df['Narration'] = df['Narration'].fillna('').astype(str)
+        else:
+            df['Narration'] = ''
+
         # Predict categories
         categories, confidences = processor.predict(df)
         
